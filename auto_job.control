@@ -1,0 +1,4 @@
+comment = 'auto job scheduler extension'
+default_version = '1.0.0'
+module_pathname = '$libdir/auto_job'
+requires = 'dblink'
