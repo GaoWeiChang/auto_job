@@ -42,7 +42,7 @@ shared_preload_libraries = 'auto_job'
 
 Compile and install
 ```
-sudo ./build.sh```
+sudo ./build.sh
 ```
 
 Connect to `postgres` database and attach `dblink` extension
