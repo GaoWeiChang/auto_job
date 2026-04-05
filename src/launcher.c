@@ -14,6 +14,40 @@
 
 
 
+/*
+    Overview
+    --------
+    The launcher runs as a single background worker in the "postgres" database.
+    Every 20 seconds it:
+      1. Calls launcher_cleanup()        — removes registry entries for databases
+                                           that were dropped or had the extension
+                                           uninstalled.
+      2. Calls launcher_spawn_all_workers() — iterates auto_job_registry and
+                                           ensures exactly one "job worker" BGW
+                                           is running per registered database.
+
+    Surviving a database crash / restart
+    -------------------------------------
+    Job workers are registered with bgw_restart_time = BGW_NEVER_RESTART, so
+    the postmaster will NOT automatically restart them after a crash.  Instead,
+    the launcher acts as the watchdog:
+
+      - spawn_worker() calls is_worker_running(), which queries pg_stat_activity
+        to check whether a "job worker" with the target datid is already alive.
+      - If the database crashed (killing its job worker), the next poll cycle
+        finds no matching entry in pg_stat_activity and calls
+        RegisterDynamicBackgroundWorker() to spawn a fresh one.
+      - Because the launcher itself connects to the always-available "postgres"
+        database (not the user database), it keeps running even while a user
+        database is down, so it can detect recovery and re-spawn the worker
+        as soon as the database comes back up.
+
+    The postmaster is responsible for restarting the launcher itself if it ever
+    crashes (configured at registration time in _PG_init).
+*/
+
+
+
 // bgw signal handler
 static volatile sig_atomic_t got_sigterm = false;
 
@@ -68,7 +102,7 @@ spawn_worker(Oid db_oid)
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
                         BGWORKER_BACKEND_DATABASE_CONNECTION;
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-    worker.bgw_restart_time = BGW_NEVER_RESTART;
+    worker.bgw_restart_time = BGW_NEVER_RESTART; // launcher will spawn this worker instead
     worker.bgw_main_arg = ObjectIdGetDatum(db_oid);
 
     RegisterDynamicBackgroundWorker(&worker, &handle);
@@ -102,7 +136,6 @@ launcher_cleanup(void)
         elog(WARNING, "auto_job launcher: failed to check for dropped extensions");
         return;
     }
-    
     dropped_count = SPI_processed;
     if (dropped_count == 0)
         return;
@@ -116,6 +149,7 @@ launcher_cleanup(void)
 
     for(uint64 i=0; i < dropped_count; i++){
         Oid db_oid = dropped_db[i];
+        elog(LOG, "auto_job launcher: dropped job worker for db oid=%u", db_oid);
 
         initStringInfo(&query);
 
@@ -143,6 +177,8 @@ static void
 launcher_spawn_all_workers(void)
 {
     int ret;
+    uint64 n;
+    Oid *db_oids;
 
     ret = SPI_execute(
         "SELECT db_oid FROM public.auto_job_registry",
@@ -153,11 +189,18 @@ launcher_spawn_all_workers(void)
         return;
     }
 
-    for(uint64 i=0; i < SPI_processed; i++){
+    n = SPI_processed;
+    if(n == 0)
+        return;
+    
+    db_oids = palloc(n * sizeof(Oid));
+    for(uint64 i=0; i < n; i++){
         bool isnull;
-        Oid db_oid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+        db_oids[i] = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+    }
 
-        spawn_worker(db_oid);
+    for(uint64 i=0; i < n; i++){
+        spawn_worker(db_oids[i]);
     }
 }
 
@@ -166,8 +209,7 @@ launcher_spawn_all_workers(void)
     Public function
 */
 
-// launcher background worker
-void 
+void
 launcher_main(Datum main_arg)
 {
     pqsignal(SIGTERM, launcher_sigterm_handler);
@@ -180,29 +222,29 @@ launcher_main(Datum main_arg)
     elog(LOG, "auto_job launcher started");
 
     while(!got_sigterm){
-        /*  Interrrupt handling logic
-                SQL command send SIGUSR1
-                        ↓
-                WaitLatch active → ResetLatch()
-                        ↓
-            CHECK_FOR_INTERRUPTS 
-    (detect ProcSignalBarrierPending flag set by the signal handler 
-        and calls ProcessProcSignalBarrier to send ack back)
-                        ↓
-        process sends an "Acknowledgment" back 
-        to the Postmaster via shared memory
-                        ↓
-            The SQL command can safely proceed
-    
-    *** without CHECK_FOR_INTERRUPTS: the Postmaster will wait forever for this worker (deadlock)
+
+        /*  Interrupt handling logic
+
+            When executing certain SQL commands, a backend process calls 
+            SendProcSignalBarrier() to request a global barrier.
+
+            The postmaster ensures that all background workers receive
+            the signal (SIGUSR1). Each worker processes it via CHECK_FOR_INTERRUPTS() 
+            and then sends an acknowledgment.
+
+            The backend waits until all workers acknowledge before proceeding.
+
+            *** WARNING: without CHECK_FOR_INTERRUPTS() here will cause the
+                backend to wait forever (deadlock)
         */
+
         WaitLatch(MyLatch,
             WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
             20000L,   // check for every 20 sec.
             PG_WAIT_EXTENSION);
         ResetLatch(MyLatch); // for wait again
 
-        // for bgw acknowledge the ProcSignalBarrier from postmaster
+        // bgw acknowledge
         CHECK_FOR_INTERRUPTS();
 
         if(got_sigterm)
