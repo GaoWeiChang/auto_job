@@ -145,7 +145,7 @@ select * from auto_job_registry;
 <img width="510" height="94" alt="image" src="https://github.com/user-attachments/assets/d05dcb10-d535-4e18-a4eb-7fe94d0d4903" />
 
 
-## & Crash & Restart Demonstration
+## Crash & Restart Demonstration
 Simulate worker revive after database crash
 - check worker is running
 <img width="810" height="159" alt="image" src="https://github.com/user-attachments/assets/f19fccec-fe6a-439f-bd3b-043bc4574722" />
